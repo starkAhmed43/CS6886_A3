@@ -88,14 +88,21 @@ def count_spikes_hook(module, input, output):
 def count_macs_hook(module, input, output):
     print(module)
 
-def conversion_job(head, train_data_loader):
-    print('---------------------------------------------')
-    print('Converting using 1/4 max(activation) as scales')
+class conversion_config:
+    presets = {
+        "max": "max",  # scale = the single largest activation seen (sensitive to outliers)
+        "99.9%": "99.9%",  # scale = the 99.9th percentile activation (ignores rare outliers)
+        "1/2 max": 1.0 / 2,  # scale = half the max activation (needs 2x the spikes of "max" per input)
+        "1/4 max": 1.0 / 4,  # scale = a quarter of the max activation (needs 4x the spikes of "max" per input)
+    }
+    preset = "1/4 max"  # change this (e.g. conversion_config.preset = "max") to switch converters
 
-    # model_converter = ann2snn.Converter(mode='max', dataloader=train_data_loader)
-    # model_converter = ann2snn.Converter(mode='99.9%', dataloader=train_data_loader)
-    # model_converter = ann2snn.Converter(mode=1.0 / 2, dataloader=train_data_loader)
-    model_converter = ann2snn.Converter(mode=1.0 / 4, dataloader=train_data_loader)
+def conversion_job(head, train_data_loader):
+    mode = conversion_config.presets[conversion_config.preset]
+    print('---------------------------------------------')
+    print(f'Converting using preset={conversion_config.preset!r} (mode={mode!r})')
+
+    model_converter = ann2snn.Converter(mode=mode, dataloader=train_data_loader)
     return model_converter(head)
 
 def val(net, device, train_data_loader, test_data_loader, T=None):

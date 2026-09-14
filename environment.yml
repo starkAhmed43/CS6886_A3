@@ -11,4 +11,4 @@ dependencies:
       - numpy==2.5.2
       - matplotlib==3.11.2
       - jupyter==1.1.1
-      - ./spikingjelly
+      - -e ./spikingjelly
