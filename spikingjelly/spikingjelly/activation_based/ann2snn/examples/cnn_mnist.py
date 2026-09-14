@@ -8,6 +8,12 @@ from tqdm import tqdm
 from spikingjelly.activation_based.ann2snn.sample_models import mnist_cnn
 import numpy as np
 import matplotlib.pyplot as plt
+import threading
+import concurrent.futures
+import multiprocessing
+import os
+import warnings
+import contextlib
 try:
     from .loader import CustomLoader
 except Exception as e:
@@ -20,9 +26,12 @@ download_model = False # downloads a 3 layer CNN classifier
 
 # variables for stat hooks
 
-class hyperparameters:
-    T = 10
-    batch_size = 100
+class _Hyperparameters(threading.local):
+    def __init__(self):
+        self.T = 10
+        self.batch_size = 100
+
+hyperparameters = _Hyperparameters()
 
 def main(eval_fn,
         backbone=None, 
@@ -81,7 +90,34 @@ def main(eval_fn,
     print('Simulating...')
     return val_model, eval_fn(val_model, device, train_data_loader, test_data_loader, T=T if head is not None else None)
 
-spike_counts = {}
+class _ThreadLocalDict(threading.local):
+    def __init__(self):
+        self.data = {}
+    def __getitem__(self, key):
+        return self.data[key]
+    def __setitem__(self, key, value):
+        self.data[key] = value
+    def __contains__(self, key):
+        return key in self.data
+    def get(self, *args, **kwargs):
+        return self.data.get(*args, **kwargs)
+    def items(self):
+        return self.data.items()
+    def keys(self):
+        return self.data.keys()
+    def values(self):
+        return self.data.values()
+    def clear(self):
+        self.data.clear()
+    def __iter__(self):
+        return iter(self.data)
+    def __len__(self):
+        return len(self.data)
+    def __repr__(self):
+        return repr(self.data)
+
+spike_counts = _ThreadLocalDict()
+
 def count_spikes_hook(module, input, output):
     name = module.__class__.__name__
     spike_counts[name] = spike_counts.get(name, 0) + output.sum().item()
@@ -122,14 +158,29 @@ def compute_conv_macs(net, device='cuda', input_shape=(1, 1, 28, 28)):
         handle.remove()
     return conv_macs
 
-class conversion_config:
-    presets = {
-        "max": "max",  # scale = the single largest activation seen (sensitive to outliers)
-        "99.9%": "99.9%",  # scale = the 99.9th percentile activation (ignores rare outliers)
-        "1/2 max": 1.0 / 2,  # scale = half the max activation (needs 2x the spikes of "max" per input)
-        "1/4 max": 1.0 / 4,  # scale = a quarter of the max activation (needs 4x the spikes of "max" per input)
-    }
-    preset = "1/4 max"  # change this (e.g. conversion_config.preset = "max") to switch converters
+def compute_fan_out(net):
+    """Static (no forward pass needed) fan-out estimate per Conv2d layer: how many
+    output positions (times out_channels) one input element feeds into, approximated
+    as kernel_h * kernel_w * out_channels. Keyed by ordinal position (0, 1, 2, ...)
+    matching conv layer order in `net`."""
+    fan_out = {}
+    conv_layers = [module for module in net.modules() if isinstance(module, nn.Conv2d)]
+    for i, module in enumerate(conv_layers):
+        kh, kw = module.kernel_size
+        fan_out[i] = module.out_channels * kh * kw
+    return fan_out
+
+class _ConversionConfig(threading.local):
+    def __init__(self):
+        self.presets = {
+            "max": "max",  # scale = the single largest activation seen (sensitive to outliers)
+            "99.9%": "99.9%",  # scale = the 99.9th percentile activation (ignores rare outliers)
+            "1/2 max": 1.0 / 2,  # scale = half the max activation (needs 2x the spikes of "max" per input)
+            "1/4 max": 1.0 / 4,  # scale = a quarter of the max activation (needs 4x the spikes of "max" per input)
+        }
+        self.preset = "1/4 max"  # change this (e.g. conversion_config.preset = "max") to switch converters
+
+conversion_config = _ConversionConfig()
 
 def conversion_job(head, train_data_loader):
     mode = conversion_config.presets[conversion_config.preset]
@@ -204,6 +255,123 @@ def val(net, device, train_data_loader, test_data_loader, T=None):
                         handle.remove()
 
     return correct / total if T is None else corrects / total
+
+
+def _search_worker(
+    checkpoint_path, blocks_converted, T, preset,
+    conv_macs, fan_out, ann_energy, conv_names, num_train_images,
+    device, dataset_dir, download_dataset, mac_energy, ac_energy,
+):
+    warnings.filterwarnings("ignore")
+    with open(os.devnull, "w") as devnull, \
+            contextlib.redirect_stdout(devnull), \
+            contextlib.redirect_stderr(devnull):
+        model = mnist_cnn.CNN().to(device)
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+
+        n = len(conv_names)
+        split_index = (n - blocks_converted) * 4
+        is_full = blocks_converted == n
+        backbone = None if is_full else model.network[:split_index]
+        head = model.network if is_full else model.network[split_index:]
+
+        conversion_config.preset = preset
+        hyperparameters.T = T
+
+        _, accuracy = main(
+            eval_fn=val,
+            backbone=backbone,
+            head=head,
+            conversion=conversion_job,
+            download_dataset=download_dataset,
+            device=device,
+            dataset_dir=dataset_dir,
+        )
+        counts = dict(spike_counts)
+
+    backbone_names = conv_names[: n - blocks_converted]
+    converted_names = conv_names[n - blocks_converted:]
+    backbone_energy = sum(conv_macs[name] for name in backbone_names) * mac_energy
+
+    converted_energy = 0.0
+    for k, _ in enumerate(converted_names):
+        spike_key = f"spiking{k}.if_node"
+        avg_spikes = counts.get(spike_key, 0.0) / num_train_images
+        orig_idx = n - blocks_converted + k
+        converted_energy += avg_spikes * fan_out[orig_idx] * ac_energy
+
+    snn_energy = backbone_energy + converted_energy
+    energy_savings = 1 - snn_energy / ann_energy
+
+    return {
+        "blocks_converted": blocks_converted,
+        "T": T,
+        "preset": preset,
+        "accuracy": accuracy[-1],
+        "accuracy_curve": accuracy,
+        "snn_energy_nJ": snn_energy,
+        "energy_savings": energy_savings,
+    }
+
+
+def search_conversion_configs(
+    checkpoint_path,
+    conv_macs,
+    fan_out,
+    ann_energy,
+    block_options=(1, 2, 3),
+    T_options=(1, 2, 5, 10, 20),
+    presets=None,
+    device='cuda',
+    dataset_dir=None,
+    download_dataset=False,
+    mac_energy=4.6,
+    ac_energy=0.6,
+    max_workers=32,
+):
+    """Search (blocks_converted, T, preset) configurations in parallel OS processes
+    (not threads), since a small SNN forward pass underutilizes the GPU and threads
+    previously deadlocked here under CUDA. Each worker process independently loads
+    the model from `checkpoint_path` onto its own CUDA context, so this uses more
+    GPU memory than a thread-based approach would (one CUDA context per worker) —
+    reduce `max_workers` if you see out-of-memory errors.
+
+    `conv_macs` and `fan_out` should come from `compute_conv_macs`/`compute_fan_out`
+    run on the full, unconverted `model.network` (ordered conv1, conv2, conv3, ...).
+    `ann_energy` is the unconverted CNN's total energy (e.g. sum(conv_macs.values()) * mac_energy).
+
+    Returns a list of result dicts, one per configuration, each with:
+    blocks_converted, T, preset, accuracy (final-timestep), accuracy_curve,
+    snn_energy_nJ, energy_savings.
+    """
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
+    if presets is None:
+        presets = list(conversion_config.presets.keys())
+
+    conv_names = list(conv_macs.keys())
+    num_train_images = len(torchvision.datasets.MNIST(
+        root=dataset_dir, train=True, download=download_dataset,
+    ))
+
+    configs = [
+        (b, T, p) for b in block_options for T in T_options for p in presets
+    ]
+
+    ctx = multiprocessing.get_context('spawn')
+    results = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = [
+            executor.submit(
+                _search_worker,
+                checkpoint_path, b, T, p,
+                conv_macs, fan_out, ann_energy, conv_names, num_train_images,
+                device, dataset_dir, download_dataset, mac_energy, ac_energy,
+            )
+            for b, T, p in configs
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+    return results
 
 
 if __name__ == '__main__':
