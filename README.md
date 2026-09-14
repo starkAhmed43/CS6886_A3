@@ -37,3 +37,7 @@ Claude Code was used to help complete this assignment:
 - Reviewed my code logic for bugs and was used to polish the code structuring.
 - Wrote code comments
 - Was used to iteratively reduce the search space for optimal results for Q6,7,9
+
+## GitHub URL
+
+This repo is publicly available at: https://github.com/starkAhmed43/CS6886_A3.git
