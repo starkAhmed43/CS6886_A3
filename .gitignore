@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Downloaded example checkpoint (SpikingJelly fork)
+spikingjelly/SJ-mnist-cnn_model-sample.pth
+
+# SpikingJelly Sphinx doc source (not needed for the assignment)
+spikingjelly/docs/
+
+# Downloaded MNIST dataset (generated at runtime, not source)
+spikingjelly/**/datasets/mnist/
