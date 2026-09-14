@@ -3,6 +3,7 @@ import torchvision
 import torch.nn as nn
 import spikingjelly
 from spikingjelly.activation_based import ann2snn
+from spikingjelly.activation_based import neuron
 from tqdm import tqdm
 from spikingjelly.activation_based.ann2snn.sample_models import mnist_cnn
 import numpy as np
@@ -85,6 +86,11 @@ def count_spikes_hook(module, input, output):
     name = module.__class__.__name__
     spike_counts[name] = spike_counts.get(name, 0) + output.sum().item()
 
+def make_spike_count_hook(name):
+    def hook(module, input, output):
+        spike_counts[name] = spike_counts.get(name, 0) + output.sum().item()
+    return hook
+
 def count_macs_hook(module, input, output):
     print(module)
 
@@ -118,8 +124,9 @@ def val(net, device, train_data_loader, test_data_loader, T=None):
     total = 0.0
     if T is not None:
         corrects = np.zeros(T)
+        spike_counts.clear()
     with torch.no_grad():
-        for batch, (img, label) in enumerate(tqdm(test_data_loader)):
+        for batch, (img, label) in enumerate(tqdm(test_data_loader, desc="Evaluating accuracy (test set)")):
             img = img.to(device)
             if T is None:
                 # not a spiking model
@@ -131,19 +138,9 @@ def val(net, device, train_data_loader, test_data_loader, T=None):
                     if hasattr(m, 'reset'):
                         m.reset()
                 for t in range(T):
-                        
-                    hooks=[count_spikes_hook]
-                    hook_nodes = [getattr(net, "").spiking0.if_node]
-
-                    handles = []
-                    for hook, hook_node in zip(hooks, hook_nodes):
-                        handles.append(hook_node.register_forward_hook(hook))
 
                     #forward pass
                     x = net(img)
-
-                    for handle in handles:
-                        handle.remove()
 
                     if t == 0:
                         out = x
@@ -151,6 +148,32 @@ def val(net, device, train_data_loader, test_data_loader, T=None):
                         out += x
                     corrects[t] += (out.argmax(dim=1) == label.to(device)).float().sum().item()
             total += out.shape[0]
+
+        # Spike-count stats: gathered on train_data_loader,
+        if T is not None:
+            for batch, (img, label) in enumerate(tqdm(train_data_loader, desc="Counting spikes (train set)")):
+                img = img.to(device)
+
+                for m in net.modules():
+                    if hasattr(m, 'reset'):
+                        m.reset()
+                for t in range(T):
+
+                    hook_nodes = {
+                        name: module
+                        for name, module in net.named_modules()
+                        if isinstance(module, neuron.IFNode)
+                    }
+                    handles = [
+                        module.register_forward_hook(make_spike_count_hook(name))
+                        for name, module in hook_nodes.items()
+                    ]
+
+                    #forward pass
+                    net(img)
+
+                    for handle in handles:
+                        handle.remove()
 
     return correct / total if T is None else corrects / total
 
