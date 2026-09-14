@@ -1,0 +1,14 @@
+name: cs6886_a3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu132
+      - torch==2.14.0+cu132
+      - torchvision==0.29.0+cu132
+      - numpy==2.5.2
+      - matplotlib==3.11.2
+      - jupyter==1.1.1
+      - ./spikingjelly
