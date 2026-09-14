@@ -1,19 +1,18 @@
 import torch
 import torchvision
 import torch.nn as nn
-import spikingjelly
 from spikingjelly.activation_based import ann2snn
 from spikingjelly.activation_based import neuron
 from tqdm import tqdm
 from spikingjelly.activation_based.ann2snn.sample_models import mnist_cnn
 import numpy as np
-import matplotlib.pyplot as plt
 import threading
 import concurrent.futures
 import multiprocessing
 import os
 import warnings
 import contextlib
+import re
 try:
     from .loader import CustomLoader
 except Exception as e:
@@ -416,6 +415,109 @@ def search_conversion_configs(
                 checkpoint_path, b, T, p,
                 conv_macs, fan_out, ann_energy, conv_names, num_train_images,
                 device, dataset_dir, download_dataset, mac_energy, ac_energy,
+            )
+            for b, T, p in configs
+        ]
+        for future in concurrent.futures.as_completed(futures):
+            results.append(future.result())
+    return results
+
+
+def _search_worker_memory(
+    checkpoint_path, blocks_converted, T, preset,
+    memory_energy, ann_memory_energy, block_names, linear_name,
+    device, dataset_dir, download_dataset,
+):
+    warnings.filterwarnings("ignore")
+    with open(os.devnull, "w") as devnull, \
+            contextlib.redirect_stdout(devnull), \
+            contextlib.redirect_stderr(devnull):
+        model = mnist_cnn.CNN().to(device)
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+
+        n = len(block_names)
+        split_index = (n - blocks_converted) * 4
+        is_full = blocks_converted == n
+        backbone = None if is_full else model.network[:split_index]
+        head = model.network if is_full else model.network[split_index:]
+
+        conversion_config.preset = preset
+        hyperparameters.T = T
+
+        _, accuracy = main(
+            eval_fn=val,
+            backbone=backbone,
+            head=head,
+            conversion=conversion_job,
+            download_dataset=download_dataset,
+            device=device,
+            dataset_dir=dataset_dir,
+        )
+
+    backbone_names = block_names[: n - blocks_converted]
+    converted_names = block_names[n - blocks_converted:] + [linear_name]
+
+    backbone_memory_energy = sum(memory_energy[name] for name in backbone_names)
+    converted_memory_energy = T * sum(memory_energy[name] for name in converted_names)
+
+    snn_memory_energy = backbone_memory_energy + converted_memory_energy
+    energy_savings = 1 - snn_memory_energy / ann_memory_energy
+
+    return {
+        "blocks_converted": blocks_converted,
+        "T": T,
+        "preset": preset,
+        "accuracy": accuracy[-1],
+        "accuracy_curve": accuracy,
+        "snn_memory_energy_nJ": snn_memory_energy,
+        "energy_savings": energy_savings,
+    }
+
+
+def search_conversion_configs_memory(
+    checkpoint_path,
+    memory_energy,
+    block_options=(1, 2, 3),
+    T_options=(1, 2, 5, 10, 20),
+    presets=None,
+    device='cuda',
+    dataset_dir=None,
+    download_dataset=False,
+    max_workers=32,
+):
+    """Like search_conversion_configs, but using the memory-aware energy model
+    from compute_memory_energy instead of the compute-only MAC/AC model.
+    Backbone (frozen, unconverted) layers pay their memory-write cost once;
+    converted (spiking) layers -- including the trailing Linear layer, which is
+    always part of the converted head for any blocks_converted in this model's
+    range -- pay it once per timestep, per the assignment's "runs at each
+    timestep" rule. Runs each configuration in its own OS process (not threads),
+    same reasoning as search_conversion_configs.
+    """
+    os.environ.setdefault("PYTHONWARNINGS", "ignore")
+    if presets is None:
+        presets = list(conversion_config.presets.keys())
+
+    block_names = sorted(
+        (name for name in memory_energy if name.startswith("block")),
+        key=lambda name: int(re.match(r"block(\d+)", name).group(1)),
+    )
+    linear_name = next(name for name in memory_energy if name.startswith("linear"))
+    ann_memory_energy = sum(memory_energy.values())
+
+    configs = [
+        (b, T, p) for b in block_options for T in T_options for p in presets
+    ]
+
+    ctx = multiprocessing.get_context('spawn')
+    results = []
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = [
+            executor.submit(
+                _search_worker_memory,
+                checkpoint_path, b, T, p,
+                memory_energy, ann_memory_energy, block_names, linear_name,
+                device, dataset_dir, download_dataset,
             )
             for b, T, p in configs
         ]
