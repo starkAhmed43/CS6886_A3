@@ -170,6 +170,56 @@ def compute_fan_out(net):
         fan_out[i] = module.out_channels * kh * kw
     return fan_out
 
+def compute_memory_energy(net, device='cuda', input_shape=(1, 1, 28, 28), write_energy_per_64B=25.0, dtype_bytes=4):
+    """Estimate the memory-write energy of one forward pass through `net`.
+
+    Since each [Conv2d, BatchNorm2d, ReLU, AvgPool2d] block is treated as fused for
+    memory accounting, only the block's final output (the AvgPool2d output) is
+    counted as a memory write and not the intermediate Conv/BatchNorm/ReLU
+    activations within that block. Any trailing Linear layer's output is costed
+    separately (Flatten is a reshape, not an actual memory write, so it's skipped).
+
+    write_energy_per_64B: energy in nJ to write one 64-byte vector to memory.
+    dtype_bytes: bytes per activation element (4 for float32).
+
+    Returns a dict of {layer_name: energy_in_nJ}, one entry per fused block plus
+    one for the final Linear layer.
+    """
+    memory_energy = {}
+
+    def make_hook(name):
+        def hook(module, input, output):
+            num_bytes = output.numel() * dtype_bytes
+            memory_energy[name] = (num_bytes / 64) * write_energy_per_64B
+        return hook
+
+    block_layers = [
+        (name, module) for name, module in net.named_modules()
+        if isinstance(module, nn.AvgPool2d)
+    ]
+    linear_layers = [
+        (name, module) for name, module in net.named_modules()
+        if isinstance(module, nn.Linear)
+    ]
+
+    handles = [
+        module.register_forward_hook(make_hook(f"block{i + 1} (fused conv+bn+relu+avgpool, layer {name})"))
+        for i, (name, module) in enumerate(block_layers)
+    ]
+    handles += [
+        module.register_forward_hook(make_hook(f"linear (layer {name})"))
+        for name, module in linear_layers
+    ]
+
+    dummy_input = torch.zeros(*input_shape, device=device)
+    with torch.no_grad():
+        net(dummy_input)
+
+    for handle in handles:
+        handle.remove()
+
+    return memory_energy
+
 class _ConversionConfig(threading.local):
     def __init__(self):
         self.presets = {
