@@ -224,4 +224,4 @@ spikingjelly/SJ-mnist-cnn_model-sample.pth
 spikingjelly/docs/
 
 # Downloaded MNIST dataset (generated at runtime, not source)
-spikingjelly/**/datasets/mnist/
+spikingjelly/datasets/mnist/
