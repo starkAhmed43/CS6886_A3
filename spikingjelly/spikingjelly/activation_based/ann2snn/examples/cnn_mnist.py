@@ -91,8 +91,36 @@ def make_spike_count_hook(name):
         spike_counts[name] = spike_counts.get(name, 0) + output.sum().item()
     return hook
 
-def count_macs_hook(module, input, output):
-    print(module)
+conv_macs = {}
+
+def make_mac_count_hook(name):
+    def hook(module, input, output):
+        out_channels, out_h, out_w = output.shape[1], output.shape[2], output.shape[3]
+        in_channels = module.in_channels
+        kh, kw = module.kernel_size
+        conv_macs[name] = out_channels * out_h * out_w * in_channels * kh * kw
+    return hook
+
+def compute_conv_macs(net, device='cuda', input_shape=(1, 1, 28, 28)):
+    """Run one dummy forward pass through `net`, hooking every Conv2d layer to
+    record its MAC count (based on actual runtime output shape) into `conv_macs`.
+    Returns `conv_macs`."""
+    conv_macs.clear()
+    conv_layers = [
+        (name, module)
+        for name, module in net.named_modules()
+        if isinstance(module, nn.Conv2d)
+    ]
+    handles = [
+        module.register_forward_hook(make_mac_count_hook(f"conv{i + 1} (layer {name})"))
+        for i, (name, module) in enumerate(conv_layers)
+    ]
+    dummy_input = torch.zeros(*input_shape, device=device)
+    with torch.no_grad():
+        net(dummy_input)
+    for handle in handles:
+        handle.remove()
+    return conv_macs
 
 class conversion_config:
     presets = {
